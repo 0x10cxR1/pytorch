@@ -1,6 +1,7 @@
 from typing import List, Callable, Dict, Optional, Any, Union
 import builtins
 import importlib
+import linecache
 from torch.serialization import _load
 import pickle
 import torch
@@ -11,6 +12,7 @@ import os.path
 from ._importlib import _normalize_line_endings, _resolve_name, _sanity_check, _calc___package__, \
     _normalize_path
 from ._mock_zipreader import MockZipReader
+from ._mangling import PackageMangler
 
 class PackageImporter:
     """Importers allow you to load code written to packages by PackageExporter.
@@ -26,10 +28,10 @@ class PackageImporter:
     a locally-installed package, but then fails when the package is copied to another machine.
     """
 
-    modules : Dict[str, Optional[types.ModuleType]]
     """The dictionary of already loaded modules from this package, equivalent to `sys.modules` but
     local to this importer.
     """
+    modules : Dict[str, Optional[types.ModuleType]]
 
     def __init__(self, filename: Union[str, torch._C.PyTorchFileReader],
                  module_allowed: Callable[[str], bool] = lambda module_name: True):
@@ -75,6 +77,8 @@ class PackageImporter:
         # allow pickles from archive using `import resources`
         self.modules['resources'] = self  # type: ignore
 
+        self._mangler = PackageMangler()
+
         # used for torch.serialization._load
         self.Unpickler = lambda *args, **kwargs: _UnpicklerWrapper(self, *args, **kwargs)
 
@@ -90,6 +94,7 @@ class PackageImporter:
         Returns:
             types.ModuleType: the (possibly already) loaded module.
         """
+        name = self._mangler.demangle(name)
         return self._gcd_import(name)
 
     def load_binary(self, package: str, resource: str) -> bytes:
@@ -136,27 +141,34 @@ class PackageImporter:
         pickle_file = self._zipfile_path(package, resource)
         return _load(self.zip_reader, map_location, self, pickle_file=pickle_file)
 
-
     def _read_extern(self):
         return self.zip_reader.get_record('extern_modules').decode('utf-8').splitlines(keepends=False)
 
     def _make_module(self, name: str, filename: Optional[str], is_package: bool, parent: str):
+        mangled_filename = self._mangler.mangle(filename) if filename else None
+
         spec = importlib.machinery.ModuleSpec(name, self, is_package=is_package)  # type: ignore
         module = importlib.util.module_from_spec(spec)
         self.modules[name] = module
+        module.__name__ = self._mangler.mangle(name)
         ns = module.__dict__
         ns['__spec__'] = spec
         ns['__loader__'] = self
-        ns['__file__'] = filename
+        ns['__file__'] = mangled_filename
         ns['__cached__'] = None
         ns['__builtins__'] = self.patched_builtins
+
+        # pre-emptively install the source in `linecache` so that stack traces,
+        # `inspect`, etc. work.
+        assert mangled_filename not in linecache.cache
+        linecache.lazycache(mangled_filename, ns)
 
         # pre-emptively install on the parent to prevent IMPORT_FROM from trying to
         # access sys.modules
         self._install_on_parent(parent, name, module)
 
         if filename is not None:
-            code = self._compile_source(filename)
+            code = self._compile_source(unmangled_filename, filename)
             exec(code, ns)
 
         return module
@@ -174,16 +186,16 @@ class PackageImporter:
                 return module
         return self._make_module(name, cur.source_file, isinstance(cur, _PackageNode), parent)  # type: ignore
 
-    def _compile_source(self, fullpath):
+    def _compile_source(self, fullpath: str, mangled_filename: str):
         source = self.zip_reader.get_record(fullpath)
         source = _normalize_line_endings(source)
-        return compile(source, fullpath, 'exec', dont_inherit=True)
+        return compile(source, mangled_filename, 'exec', dont_inherit=True)
 
     # note: named `get_source` so that linecache can find the source
     # when this is the __loader__ of a module.
     def get_source(self, module_name) -> str:
         module = self.import_module(module_name)
-        return self.zip_reader.get_record(module.__file__).decode('utf-8')
+        return self.zip_reader.get_record(self._mangler.demangle(module.__file__)).decode('utf-8')
 
     def _install_on_parent(self, parent: str, name: str, module: types.ModuleType):
         if not parent:
@@ -284,6 +296,7 @@ class PackageImporter:
         return module
 
     def __import__(self, name, globals=None, locals=None, fromlist=(), level=0):
+        name = self._mangler.demangle(name)
         if level == 0:
             module = self._gcd_import(name)
         else:
@@ -330,7 +343,8 @@ class PackageImporter:
         package = self._get_package(package)
         resource = _normalize_path(resource)
         assert package.__loader__ is self
-        return f"{package.__name__.replace('.', '/')}/{resource}"
+        name = self._mangler.demangle(package.__name__)
+        return f"{name.replace('.', '/')}/{resource}"
 
     def _get_or_create_package(self, atoms: List[str]) -> 'Union[_PackageNode, _ExternNode]':
         cur = self.root

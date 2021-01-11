@@ -1,7 +1,8 @@
-from pickle import Pickler, _Pickler, _getattribute, whichmodule, _extension_registry, _compat_pickle  # type: ignore
+from pickle import Pickler, whichmodule, _Pickler, _getattribute, _extension_registry, _compat_pickle  # type: ignore
 from pickle import GLOBAL, STACK_GLOBAL, EXT1, EXT2, EXT4, PicklingError
 from types import FunctionType
 from struct import pack
+from ._mangling import demangle
 import importlib
 
 
@@ -24,7 +25,9 @@ class CustomImportPickler(_Pickler):
         if name is None:
             name = obj.__name__
 
-        module_name = whichmodule(obj, name)
+        orig_module_name = whichmodule(obj, name)
+        # CHANGED: demangle the module name before importing.
+        module_name = demangle(orig_module_name)
         try:
             # CHANGED: self.import_module rather than
             # __import__
@@ -54,6 +57,7 @@ class CustomImportPickler(_Pickler):
         lastname = name.rpartition('.')[2]
         if parent is module:
             name = lastname
+
         # Non-ASCII identifiers are supported only with protocols >= 3.
         if self.proto >= 4:
             self.save(module_name)
